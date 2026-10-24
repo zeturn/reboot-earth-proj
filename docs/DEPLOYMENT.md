@@ -48,58 +48,57 @@ Never put credentials in Git, build arguments, image layers or browser variables
 There is no production Gemini key and no APICred dependency. After rotating the
 OpenAI key in the backend Secret, restart only `deployment/reboot-earth-backend`.
 
-## CI/CD: release by pushing a tag
+## Current release process: manual deployment
 
-Pull requests and pushes to `main` run CI. **Every pushed tag** triggers
-`.github/workflows/release.yml`, using the exact tagged commit, not the moving
-`main` branch. Creating a tag only on your laptop is not enough; push it:
+Pull requests and pushes to `main` run `.github/workflows/ci.yml`, which imports
+the bundled data into a disposable CI database, runs backend and deployment tests,
+then lints and builds the frontend. **CI does not deploy the application.** The
+tag-triggered `.github/workflows/release.yml` was removed upstream; pushing a tag
+at the current revision does not automatically update production. Do not assume
+older tagged revisions have the same workflow behavior.
 
-```bash
-git switch main
-git pull --ff-only origin main
-git tag -a v0.1.1 -m "Release v0.1.1"
-git push origin v0.1.1
-```
+Production updates are performed manually through SSH and the BeanCS V2 API:
 
-Use a new, unique tag for each release. Tags must point to commits that include
-the release workflow. Tags from other branches and prerelease tags also deploy
-to **production**, so tag only code you intend to publish. GitHub workflow
-concurrency queues releases (up to 100 pending runs) without canceling one that
-is already running.
+1. Fetch upstream changes, review and merge them while preserving author history,
+   then push the selected commit to `zeturn/reboot-earth-proj`.
+2. Test and build production amd64 images on a workstation or a suitable build
+   runner. Do not run heavy image builds on the memory-constrained control node.
+3. Publish the required images to the private Harbor project `reboot-earth-proj`.
+   Record immutable digests and the full source revision. Build-time configuration
+   must not contain model or database credentials.
+4. Create BeanCS releases for the changed components, reusing their last-good
+   runtime configuration and bindings. For frontend-only changes, leave the
+   backend deployment untouched. Preserve the worker selection, database PVC and
+   existing Secrets.
+5. Wait for rollout, verify the running image digests, public HTTPS pages, SQL data
+   and server-side OpenAI configuration. Confirm the requested feature appears.
+   Routine checks do not need to spend model tokens. Roll back the changed
+   components through BeanCS if deployment or service verification fails.
 
-The automatic chain is:
+BeanCS's native rollout readiness window is two minutes; a cold image pull can
+take longer. The helper in `deploy/beancs.py` includes bounded retries for this
+specific timeout, as well as immutable-release and rollback safeguards. It is
+not an active automatic deployment workflow. Record manual release IDs and
+verification results in the operator's deployment log.
 
-1. Import source data into a disposable CI PostGIS service and run backend tests,
-   deployment safety tests, frontend lint and a production frontend build.
-2. Build amd64 images on GitHub-hosted runners, using this repository's GitHub
-   Actions billing. The control node does not build application images.
-3. Push unique run/attempt image tags to the private Harbor project
-   `reboot-earth-proj` (`backend` and `frontend` repositories).
-4. Resolve immutable image digests through BeanCS, reuse the previous successful
-   runtime configuration, then roll out backend and frontend sequentially.
-5. Verify public HTTPS pages, SQL data counts and the server-side OpenAI
-   configuration without spending model tokens. If rollout or verification
-   fails, request rollback to the previous successful releases and fail the run.
+The control node can stream prebuilt images through the cluster-local registry
+when a workstation's registry push encounters gateway errors. This does not
+require building on the control node. Use task-scoped access where possible,
+keep credentials out of logs, and revoke temporary deployment keys afterward.
 
-BeanCS's native rollout readiness window is two minutes. First-time image pulls
-can exceed it, so the workflow retries a reported rollout timeout up to twice,
-reapplying the same immutable release without restarting its downloading pod.
-Other deployment errors fail immediately; persistent timeouts still roll back.
-
-Track progress in [GitHub Actions](https://github.com/zeturn/reboot-earth-proj/actions)
-and BeanCS deployment history. Successful workflow summaries include the exact
-commit, image digests and BeanCS release IDs. Database volumes, secrets and user
-contributions are not rebuilt, reimported or deleted by this pipeline. Releases
-must remain backward-compatible with the current database; destructive schema
-migrations are deliberately outside this automatic workflow.
+Releases must remain backward-compatible with the existing database. Do not
+reimport or replace production tables as part of a normal image update;
+destructive schema migrations require separate planning and backups.
 
 `deploy/production.json` contains non-secret target IDs. The artifact connection
 is `ee14ae4f-80b9-4a26-8f6f-8245512a5af6`, backed by a pull-only credential for
 this project's registry. Existing Kubernetes worker node selection is preserved.
 
-### CI credentials and rotation
+### Previously provisioned CI credentials and rotation
 
-The GitHub `production` environment accepts tag deployments only and contains:
+The earlier tag-release pipeline provisioned a GitHub `production` environment
+restricted to tags, with these credentials and configuration. They are not used
+by the current test-only CI workflow; their presence does not enable deployment:
 
 - `BEANCS_API_KEY`: `applications:read`, `deployments:read`, `deployments:write`;
   no administrator, runtime, API-key management or credential-read privileges.
@@ -115,10 +114,9 @@ rotate it there and refresh the deployment pull secrets as well. No SSH password
 kubeconfig, registry administrator password or OpenAI key is copied to Actions.
 Actions are pinned to verified commit SHAs; review updates before changing them.
 
-Manual recovery still uses BeanCS release rollback. If the management API itself
-is unavailable, a workflow cannot guarantee rollback; restore API connectivity
-and inspect the failed workflow and cluster before retrying. Never delete the
-database namespace or PVC as a release recovery step.
+Manual recovery uses BeanCS release rollback. If the management API itself is
+unavailable, restore API connectivity and inspect the cluster before retrying.
+Never delete the database namespace or PVC as a release recovery step.
 
 ## Data and recovery
 
@@ -150,6 +148,7 @@ kubectl -n proj-reboot-earth logs deployment/reboot-earth-backend --tail=50
 kubectl -n proj-reboot-earth logs deployment/reboot-earth-frontend --tail=50
 ```
 
-Verified after deployment: HTTPS pages, catalog counts, spatial SQL (trees within
-100 m and no taller than 10 m), SQL write rejection, malformed upload rejection,
-and a real OpenAI answer grounded in the database's 64,295-tree count.
+Initial deployment checks included HTTPS pages, catalog counts, spatial SQL
+(trees within 100 m and no taller than 10 m), SQL write rejection, malformed upload
+rejection, and a real OpenAI answer grounded in the database. Community imports
+can increase the original counts; routine releases must retain these additions.
